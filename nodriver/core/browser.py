@@ -13,6 +13,7 @@ import logging
 import os
 import pathlib
 import pickle
+import signal
 import urllib.parse
 import urllib.request
 import warnings
@@ -26,6 +27,41 @@ from .config import Config, PathLike, is_posix
 from .connection import Connection
 
 logger = logging.getLogger(__name__)
+
+
+# Set up SIGCHLD handler to automatically reap zombie child processes
+# This prevents accumulation of zombie processes when browser child processes terminate
+def _sigchld_handler(signum, frame):
+    """Reap any zombie child processes to prevent zombie accumulation."""
+    while True:
+        try:
+            # WNOHANG: return immediately if no child has exited
+            pid, status = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+            logger.debug(f"Reaped zombie child process {pid} with status {status}")
+        except ChildProcessError:
+            # No more children to reap
+            break
+        except Exception:
+            break
+
+
+def _setup_sigchld_handler():
+    """Set up SIGCHLD handler only on POSIX systems."""
+    if is_posix:
+        try:
+            # Only set handler if not already set to something other than default
+            current_handler = signal.getsignal(signal.SIGCHLD)
+            if current_handler in (signal.SIG_DFL, signal.SIG_IGN, None):
+                signal.signal(signal.SIGCHLD, _sigchld_handler)
+                logger.debug("SIGCHLD handler installed for zombie process prevention")
+        except Exception as e:
+            logger.debug(f"Could not install SIGCHLD handler: {e}")
+
+
+# Install SIGCHLD handler at module load time
+_setup_sigchld_handler()
 
 
 class Browser:
@@ -679,6 +715,10 @@ class Browser:
                 except Exception:
                     pass
 
+        process_pid = None
+        if self._process:
+            process_pid = self._process.pid
+
         for _ in range(3):
             try:
                 self._process.terminate()
@@ -715,8 +755,31 @@ class Browser:
                         pass
                     except (Exception,):
                         raise
-            self._process = None
-            self._process_pid = None
+
+        # Wait for the process to be reaped to prevent zombie processes
+        if self._process:
+            try:
+                # Try to wait synchronously with a short timeout
+                import subprocess
+                try:
+                    self._process._transport.close()
+                except Exception:
+                    pass
+                # Use os.waitpid with WNOHANG to reap zombie without blocking
+                if process_pid:
+                    try:
+                        os.waitpid(process_pid, os.WNOHANG)
+                        logger.debug("reaped browser process %d" % process_pid)
+                    except ChildProcessError:
+                        # Process already reaped
+                        pass
+                    except Exception as e:
+                        logger.debug("waitpid failed: %s" % e)
+            except Exception as e:
+                logger.debug("process cleanup warning: %s" % e)
+
+        self._process = None
+        self._process_pid = None
 
     def __await__(self):
         # return ( asyncio.sleep(0)).__await__()
